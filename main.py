@@ -1,30 +1,23 @@
 import json
 import uuid
 import os
-import pathlib
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Text, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 import traceback
 
-# In-memory SQLite on Render (reliable), file-based elsewhere
 if os.getenv("RENDER"):
     SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
 else:
     SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./instigator.db")
 
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL,
-    connect_args={"check_same_thread": False},
-    pool_pre_ping=True,
-)
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -61,7 +54,7 @@ class Account(Base):
 try:
     Base.metadata.create_all(bind=engine)
 except Exception as e:
-    print(f"DB create warning: {e}")
+    print(f"DB warning: {e}")
 
 class CampaignCreate(BaseModel):
     name: str
@@ -90,16 +83,7 @@ app = FastAPI(title="Instigator DSP")
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    return PlainTextResponse(f"ERROR on {request.url.path}:\n\n{tb}", status_code=500)
-
-BASE_DIR = pathlib.Path(__file__).resolve().parent
-TEMPLATES_DIR = BASE_DIR / "templates"
-templates = None
-try:
-    if TEMPLATES_DIR.exists():
-        templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
-except Exception as e:
-    print(f"Template warning: {e}")
+    return PlainTextResponse(f"ERROR:\n{tb}", status_code=500)
 
 def get_db():
     db = SessionLocal()
@@ -116,37 +100,121 @@ def init_db():
             db.add(Account(name="Instigator Default", credit_balance=1000.0))
             db.commit()
         db.close()
-    except Exception as e:
-        print(f"init_db warning: {e}")
+    except Exception:
+        pass
 
-FALLBACK_HTML = """
-<!DOCTYPE html>
+def render_dashboard(campaigns, account):
+    credit = f"${account.credit_balance:.2f} {account.currency}" if account else "$0.00"
+    rows = ""
+    if campaigns:
+        for c in campaigns:
+            geos = ", ".join(c.geos) if c.geos else "Global"
+            status = "Active" if c.active else "Paused"
+            rows += f"""
+            <tr class="border-t">
+              <td class="p-2">{c.name}</td>
+              <td class="p-2">${c.budget:.2f}</td>
+              <td class="p-2">${c.spent:.2f}</td>
+              <td class="p-2">${c.bid_price:.2f}</td>
+              <td class="p-2">{geos}</td>
+              <td class="p-2">{status}</td>
+              <td class="p-2"><button onclick="toggleCampaign({c.id})" class="text-sm bg-gray-200 px-2 py-1 rounded">Toggle</button></td>
+            </tr>"""
+    else:
+        rows = '<tr><td colspan="7" class="p-4 text-center text-gray-500">No campaigns yet. Create one above.</td></tr>'
+
+    return f"""<!DOCTYPE html>
 <html>
-<head><title>Instigator DSP</title><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="bg-gray-100 p-8">
-  <h1 class="text-4xl font-bold text-indigo-700">Instigator DSP</h1>
-  <p class="mt-2">Dashboard is loading in fallback mode.</p>
-  <p class="mt-4">OpenRTB endpoint: POST /openrtb/bid</p>
-  <p>Health: <a href="/health" class="text-blue-600">/health</a></p>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Instigator DSP</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100">
+  <div class="container mx-auto px-4 py-8">
+    <header class="mb-8">
+      <h1 class="text-4xl font-bold text-indigo-700">Instigator DSP</h1>
+      <p class="text-gray-600">Demand Side Platform MVP • Ready for OpenRTB & Payments</p>
+      <div class="mt-2 bg-white p-4 rounded shadow inline-block">
+        <span class="font-semibold">Credit Balance:</span> {credit}
+      </div>
+    </header>
+    <section class="mb-8 bg-white p-6 rounded shadow">
+      <h2 class="text-2xl font-semibold mb-4">Create Campaign</h2>
+      <form id="campaignForm" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <input type="text" id="name" placeholder="Campaign Name" class="border p-2 rounded" required>
+        <input type="number" id="budget" placeholder="Total Budget ($)" step="0.01" class="border p-2 rounded" required>
+        <input type="number" id="daily_cap" placeholder="Daily Cap ($)" step="0.01" class="border p-2 rounded">
+        <input type="number" id="bid_price" placeholder="Bid Price (CPM $)" step="0.01" class="border p-2 rounded" required>
+        <input type="text" id="geos" placeholder="Geos (comma-separated: GE,RU,AE,ZA)" class="border p-2 rounded md:col-span-2">
+        <textarea id="creative_html" placeholder="Creative HTML" class="border p-2 rounded md:col-span-2" rows="3"></textarea>
+        <button type="submit" class="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700 md:col-span-2">Create Campaign</button>
+      </form>
+    </section>
+    <section class="bg-white p-6 rounded shadow">
+      <h2 class="text-2xl font-semibold mb-4">Campaigns</h2>
+      <div class="overflow-x-auto">
+        <table class="min-w-full">
+          <thead>
+            <tr class="bg-gray-50">
+              <th class="text-left p-2">Name</th>
+              <th class="text-left p-2">Budget</th>
+              <th class="text-left p-2">Spent</th>
+              <th class="text-left p-2">Bid CPM</th>
+              <th class="text-left p-2">Geos</th>
+              <th class="text-left p-2">Status</th>
+              <th class="text-left p-2">Actions</th>
+            </tr>
+          </thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+    </section>
+    <section class="mt-8 bg-white p-6 rounded shadow">
+      <h2 class="text-2xl font-semibold mb-2">OpenRTB Endpoint</h2>
+      <p>Ready for SSP connections:</p>
+      <code class="block bg-gray-100 p-2 mt-2 rounded">POST /openrtb/bid</code>
+    </section>
+  </div>
+  <script>
+    document.getElementById('campaignForm').addEventListener('submit', async (e) => {{
+      e.preventDefault();
+      const geos = document.getElementById('geos').value.split(',').map(g => g.trim().toUpperCase()).filter(Boolean);
+      const payload = {{
+        name: document.getElementById('name').value,
+        budget: parseFloat(document.getElementById('budget').value),
+        daily_cap: parseFloat(document.getElementById('daily_cap').value) || 0,
+        bid_price: parseFloat(document.getElementById('bid_price').value),
+        geos: geos,
+        creative_html: document.getElementById('creative_html').value || '<div style="background:#eee;padding:10px">Instigator Ad</div>',
+        active: true
+      }};
+      const res = await fetch('/api/campaigns', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify(payload)
+      }});
+      if (res.ok) location.reload();
+      else alert('Error creating campaign');
+    }});
+    async function toggleCampaign(id) {{
+      await fetch('/api/campaigns/' + id + '/toggle', {{ method: 'PUT' }});
+      location.reload();
+    }}
+  </script>
 </body>
-</html>
-"""
+</html>"""
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request, db: Session = Depends(get_db)):
+async def dashboard(db: Session = Depends(get_db)):
     try:
         campaigns = db.query(Campaign).all()
         account = db.query(Account).first()
-        if templates:
-            return templates.TemplateResponse("dashboard.html", {
-                "request": request,
-                "campaigns": campaigns or [],
-                "account": account,
-                "title": "Instigator DSP"
-            })
-    except Exception as e:
-        print(f"Dashboard error: {e}")
-    return HTMLResponse(content=FALLBACK_HTML)
+    except Exception:
+        campaigns = []
+        account = None
+    return HTMLResponse(content=render_dashboard(campaigns, account))
 
 @app.post("/api/campaigns", response_model=CampaignOut)
 def create_campaign(campaign: CampaignCreate, db: Session = Depends(get_db)):
@@ -186,10 +254,7 @@ async def openrtb_bid(request: Request, db: Session = Depends(get_db)):
     country = geo.get("country", "").upper()
 
     try:
-        matching = db.query(Campaign).filter(
-            Campaign.active == True,
-            Campaign.spent < Campaign.budget
-        ).all()
+        matching = db.query(Campaign).filter(Campaign.active == True, Campaign.spent < Campaign.budget).all()
     except Exception:
         matching = []
 
@@ -199,54 +264,33 @@ async def openrtb_bid(request: Request, db: Session = Depends(get_db)):
         if campaign.geos and country not in [g.upper() for g in (campaign.geos or [])]:
             continue
         if campaign.bid_price > 0 and (not best_bid or campaign.bid_price > best_bid["price"]):
-            best_bid = {
-                "price": campaign.bid_price,
-                "adm": campaign.creative_html or "<div>Instigator Ad</div>"
-            }
+            best_bid = {"price": campaign.bid_price, "adm": campaign.creative_html or "<div>Instigator Ad</div>"}
             best_campaign = campaign
 
     if not best_bid:
         return JSONResponse(status_code=204, content={})
 
     try:
-        log = BidLog(
-            campaign_id=best_campaign.id,
-            request_id=request_id,
-            country=country,
-            bid_price=best_bid["price"]
-        )
+        log = BidLog(campaign_id=best_campaign.id, request_id=request_id, country=country, bid_price=best_bid["price"])
         db.add(log)
         db.commit()
     except Exception:
         pass
 
-    return {
+    return {{
         "id": request_id,
-        "seatbid": [{
-            "bid": [{
-                "id": str(uuid.uuid4()),
-                "impid": impressions[0].get("id", "1"),
-                "price": best_bid["price"],
-                "adm": best_bid["adm"],
-                "crid": f"instigator-{best_campaign.id}",
-                "cid": str(best_campaign.id),
-                "adid": str(best_campaign.id)
-            }]
-        }],
+        "seatbid": [{{"bid": [{{
+            "id": str(uuid.uuid4()),
+            "impid": impressions[0].get("id", "1"),
+            "price": best_bid["price"],
+            "adm": best_bid["adm"],
+            "crid": f"instigator-{{best_campaign.id}}",
+            "cid": str(best_campaign.id),
+            "adid": str(best_campaign.id)
+        }}]}}],
         "cur": "USD"
-    }
+    }}
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "service": "Instigator DSP", "db": "memory" if os.getenv("RENDER") else "file"}
-
-@app.get("/billing")
-def billing_info(db: Session = Depends(get_db)):
-    try:
-        account = db.query(Account).first()
-        return {
-            "credit_balance": account.credit_balance if account else 0,
-            "currency": "USD"
-        }
-    except Exception:
-        return {"credit_balance": 0, "currency": "USD"}
+    return {{"status": "healthy", "service": "Instigator DSP"}}
