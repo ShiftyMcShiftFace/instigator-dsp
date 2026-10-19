@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100">
+    <div class="container mx-auto px-4 py-8">
+        <header class="mb-8">
+            <h1 class="text-4xl font-bold text-indigo-700">Instigator DSP</h1>
+            <p class="text-gray-600">Demand Side Platform MVP • Ready for OpenRTB & Payments</p>
+            {% if account %}
+            <div class="mt-2 bg-white p-4 rounded shadow inline-block">
+                <span class="font-semibold">Credit Balance:</span> ${{ "%.2f"|format(account.credit_balance) }} {{ account.currency }}
+            </div>
+            {% endif %}
+        </header>
+        <section class="mb-8 bg-white p-6 rounded shadow">
+            <h2 class="text-2xl font-semibold mb-4">Create Campaign</h2>
+            <form id="campaignForm" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <input type="text" id="name" placeholder="Campaign Name" class="border p-2 rounded" required>
+                <input type="number" id="budget" placeholder="Total Budget ($)" step="0.01" class="border p-2 rounded" required>
+                <input type="number" id="daily_cap" placeholder="Daily Cap ($)" step="0.01" class="border p-2 rounded">
+                <input type="number" id="bid_price" placeholder="Bid Price (CPM $)" step="0.01" class="border p-2 rounded" required>
+                <input type="text" id="geos" placeholder="Geos (comma-separated: GE,RU,AE,ZA)" class="border p-2 rounded md:col-span-2">
+                <textarea id="creative_html" placeholder="Creative HTML" class="border p-2 rounded md:col-span-2" rows="3"></textarea>
+                <button type="submit" class="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700 md:col-span-2">Create Campaign</button>
+            </form>
+        </section>
+        <section class="bg-white p-6 rounded shadow">
+            <h2 class="text-2xl font-semibold mb-4">Active Campaigns</h2>
+            <div class="overflow-x-auto">
+                <table class="min-w-full">
+                    <thead>
+                        <tr class="bg-gray-50">
+                            <th class="text-left p-2">Name</th>
+                            <th class="text-left p-2">Budget</th>
+                            <th class="text-left p-2">Spent</th>
+                            <th class="text-left p-2">Bid CPM</th>
+                            <th class="text-left p-2">Geos</th>
+                            <th class="text-left p-2">Status</th>
+                            <th class="text-left p-2">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for c in campaigns %}
+                        <tr class="border-t">
+                            <td class="p-2">{{ c.name }}</td>
+                            <td class="p-2">${{ "%.2f"|format(c.budget) }}</td>
+                            <td class="p-2">${{ "%.2f"|format(c.spent) }}</td>
+                            <td class="p-2">${{ "%.2f"|format(c.bid_price) }}</td>
+                            <td class="p-2">{{ c.geos|join(', ') if c.geos else 'Global' }}</td>
+                            <td class="p-2">{{ 'Active' if c.active else 'Paused' }}</td>
+                            <td class="p-2">
+                                <button onclick="toggleCampaign({{ c.id }})" class="text-sm bg-gray-200 px-2 py-1 rounded">Toggle</button>
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="7" class="p-4 text-center text-gray-500">No campaigns yet. Create one above.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+        <section class="mt-8 bg-white p-6 rounded shadow">
+            <h2 class="text-2xl font-semibold mb-2">OpenRTB Endpoint</h2>
+            <p class="text-gray-700">Ready for SSP connections:</p>
+            <code class="block bg-gray-100 p-2 mt-2 rounded">POST /openrtb/bid</code>
+            <p class="mt-2 text-sm text-gray-500">Send standard OpenRTB BidRequest JSON. Returns BidResponse or 204 No Content.</p>
+        </section>
+    </div>
+    <script>
+        document.getElementById('campaignForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const geos = document.getElementById('geos').value.split(',').map(g => g.trim().toUpperCase()).filter(Boolean);
+            const payload = {
+                name: document.getElementById('name').value,
+                budget: parseFloat(document.getElementById('budget').value),
+                daily_cap: parseFloat(document.getElementById('daily_cap').value) || 0,
+                bid_price: parseFloat(document.getElementById('bid_price').value),
+                geos: geos,
+                creative_html: document.getElementById('creative_html').value || '<div style="background:#eee;padding:10px">Instigator Ad</div>',
+                active: true
+            };
+            const res = await fetch('/api/campaigns', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+            if (res.ok) {
+                location.reload();
+            } else {
+                alert('Error creating campaign');
+            }
+        });
+        async function toggleCampaign(id) {
+            await fetch(`/api/campaigns/${id}/toggle`, { method: 'PUT' });
+            location.reload();
+        }
+    </script>
+</body>
+</html>
