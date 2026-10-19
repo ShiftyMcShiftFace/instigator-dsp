@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+instigator.db
+*.db
+.env
+.venv/
+venv/
+env/
