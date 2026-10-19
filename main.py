@@ -1,23 +1,30 @@
-import json
-import uuid
 import os
+import uuid
+import traceback
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 
 from fastapi import FastAPI, HTTPException, Request, Depends
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Text, JSON
+from fastapi.responses import HTMLResponse, JSONResponse
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Text, JSON, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.pool import StaticPool
 from pydantic import BaseModel
-import traceback
 
+# Shared in-memory SQLite (one database for all connections)
 if os.getenv("RENDER"):
-    SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
 else:
-    SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./instigator.db")
+    engine = create_engine(
+        os.getenv("DATABASE_URL", "sqlite:///./instigator.db"),
+        connect_args={"check_same_thread": False},
+    )
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -41,10 +48,7 @@ class Account(Base):
     credit_balance = Column(Float, default=1000.0)
     currency = Column(String, default="USD")
 
-try:
-    Base.metadata.create_all(bind=engine)
-except Exception as e:
-    print(f"DB warning: {e}")
+Base.metadata.create_all(bind=engine)
 
 class CampaignCreate(BaseModel):
     name: str
@@ -54,19 +58,6 @@ class CampaignCreate(BaseModel):
     geos: List[str] = []
     creative_html: str = ""
     active: bool = True
-
-class CampaignOut(BaseModel):
-    id: int
-    name: str
-    budget: float
-    spent: float
-    daily_cap: float
-    bid_price: float
-    geos: List[str]
-    creative_html: str
-    active: bool
-    class Config:
-        from_attributes = True
 
 app = FastAPI(title="Instigator DSP")
 
@@ -78,16 +69,14 @@ def get_db():
         db.close()
 
 @app.on_event("startup")
-def init_db():
+def startup():
+    db = SessionLocal()
     try:
-        Base.metadata.create_all(bind=engine)
-        db = SessionLocal()
         if not db.query(Account).first():
             db.add(Account(name="Instigator Default", credit_balance=1000.0))
             db.commit()
+    finally:
         db.close()
-    except Exception as e:
-        print(f"init warning: {e}")
 
 def render_dashboard(campaigns, account):
     credit = f"${account.credit_balance:.2f} {account.currency}" if account else "$0.00"
@@ -185,7 +174,7 @@ async def dashboard(db: Session = Depends(get_db)):
     try:
         campaigns = db.query(Campaign).all()
         account = db.query(Account).first()
-    except Exception:
+    except Exception as e:
         campaigns = []
         account = None
     return HTMLResponse(content=render_dashboard(campaigns, account))
@@ -193,15 +182,14 @@ async def dashboard(db: Session = Depends(get_db)):
 @app.post("/api/campaigns")
 def create_campaign(campaign: CampaignCreate, db: Session = Depends(get_db)):
     try:
-        Base.metadata.create_all(bind=engine)
         db_campaign = Campaign(
             name=campaign.name,
-            budget=campaign.budget,
-            daily_cap=campaign.daily_cap,
-            bid_price=campaign.bid_price,
-            geos=campaign.geos or [],
-            creative_html=campaign.creative_html,
-            active=campaign.active
+            budget=float(campaign.budget),
+            daily_cap=float(campaign.daily_cap),
+            bid_price=float(campaign.bid_price),
+            geos=list(campaign.geos or []),
+            creative_html=campaign.creative_html or "",
+            active=bool(campaign.active),
         )
         db.add(db_campaign)
         db.commit()
@@ -210,15 +198,18 @@ def create_campaign(campaign: CampaignCreate, db: Session = Depends(get_db)):
             "id": db_campaign.id,
             "name": db_campaign.name,
             "budget": db_campaign.budget,
-            "spent": db_campaign.spent,
-            "daily_cap": db_campaign.daily_cap,
+            "spent": db_campaign.spent or 0,
+            "daily_cap": db_campaign.daily_cap or 0,
             "bid_price": db_campaign.bid_price,
             "geos": db_campaign.geos or [],
-            "creative_html": db_campaign.creative_html,
-            "active": db_campaign.active
+            "creative_html": db_campaign.creative_html or "",
+            "active": db_campaign.active,
         }}
     except Exception as e:
-        return JSONResponse(status_code=500, content={{"error": str(e), "traceback": traceback.format_exc()}})
+        return JSONResponse(
+            status_code=500,
+            content={{"error": str(e), "traceback": traceback.format_exc()}},
+        )
 
 @app.put("/api/campaigns/{campaign_id}/toggle")
 def toggle_campaign(campaign_id: int, db: Session = Depends(get_db)):
@@ -243,10 +234,13 @@ async def openrtb_bid(request: Request, db: Session = Depends(get_db)):
 
     device = bid_request.get("device", {})
     geo = device.get("geo", {})
-    country = geo.get("country", "").upper()
+    country = (geo.get("country") or "").upper()
 
     try:
-        matching = db.query(Campaign).filter(Campaign.active == True, Campaign.spent < Campaign.budget).all()
+        matching = db.query(Campaign).filter(
+            Campaign.active == True,
+            Campaign.spent < Campaign.budget
+        ).all()
     except Exception:
         matching = []
 
@@ -257,7 +251,10 @@ async def openrtb_bid(request: Request, db: Session = Depends(get_db)):
         if geos and country not in [g.upper() for g in geos]:
             continue
         if campaign.bid_price > 0 and (not best_bid or campaign.bid_price > best_bid["price"]):
-            best_bid = {"price": campaign.bid_price, "adm": campaign.creative_html or "<div>Instigator Ad</div>"}
+            best_bid = {
+                "price": campaign.bid_price,
+                "adm": campaign.creative_html or "<div>Instigator Ad</div>",
+            }
             best_campaign = campaign
 
     if not best_bid:
@@ -265,15 +262,17 @@ async def openrtb_bid(request: Request, db: Session = Depends(get_db)):
 
     return {{
         "id": request_id,
-        "seatbid": [{{"bid": [{{
-            "id": str(uuid.uuid4()),
-            "impid": impressions[0].get("id", "1"),
-            "price": best_bid["price"],
-            "adm": best_bid["adm"],
-            "crid": f"instigator-{{best_campaign.id}}",
-            "cid": str(best_campaign.id)
-        }}]}}],
-        "cur": "USD"
+        "seatbid": [{{
+            "bid": [{{
+                "id": str(uuid.uuid4()),
+                "impid": impressions[0].get("id", "1"),
+                "price": best_bid["price"],
+                "adm": best_bid["adm"],
+                "crid": f"instigator-{{best_campaign.id}}",
+                "cid": str(best_campaign.id),
+            }}]
+        }}],
+        "cur": "USD",
     }}
 
 @app.get("/health")
