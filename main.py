@@ -1,5 +1,7 @@
 import json
 import uuid
+import os
+import pathlib
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 
@@ -11,8 +13,17 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 
-import os
-SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./instigator.db")
+# Robust template path (works on Render)
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+TEMPLATES_DIR = BASE_DIR / "templates"
+
+# Database setup - use /tmp on Render for writability
+def get_database_url():
+    if os.getenv("RENDER"):
+        return "sqlite:////tmp/instigator.db"
+    return os.getenv("DATABASE_URL", "sqlite:///./instigator.db")
+
+SQLALCHEMY_DATABASE_URL = get_database_url()
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
     connect_args={"check_same_thread": False} if SQLALCHEMY_DATABASE_URL.startswith("sqlite") else {},
@@ -51,7 +62,10 @@ class Account(Base):
     credit_balance = Column(Float, default=1000.0)
     currency = Column(String, default="USD")
 
-Base.metadata.create_all(bind=engine)
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as e:
+    print(f"Warning: could not create tables: {e}")
 
 class CampaignCreate(BaseModel):
     name: str
@@ -77,7 +91,7 @@ class CampaignOut(BaseModel):
 
 app = FastAPI(title="Instigator DSP", description="Demand Side Platform MVP for Programmatic Advertising")
 
-templates = Jinja2Templates(directory="templates")
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 def get_db():
     db = SessionLocal()
@@ -88,18 +102,23 @@ def get_db():
 
 @app.on_event("startup")
 def init_db():
-    db = SessionLocal()
     try:
+        db = SessionLocal()
         if not db.query(Account).first():
             db.add(Account(name="Instigator Default", credit_balance=1000.0))
             db.commit()
-    finally:
         db.close()
+    except Exception as e:
+        print(f"Warning: init_db failed: {e}")
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request, db: Session = Depends(get_db)):
-    campaigns = db.query(Campaign).all()
-    account = db.query(Account).first()
+    try:
+        campaigns = db.query(Campaign).all()
+        account = db.query(Account).first()
+    except Exception:
+        campaigns = []
+        account = None
     return templates.TemplateResponse("dashboard.html", {
         "request": request,
         "campaigns": campaigns,
@@ -144,10 +163,13 @@ async def openrtb_bid(request: Request, db: Session = Depends(get_db)):
     geo = device.get("geo", {})
     country = geo.get("country", "").upper()
 
-    matching = db.query(Campaign).filter(
-        Campaign.active == True,
-        Campaign.spent < Campaign.budget
-    ).all()
+    try:
+        matching = db.query(Campaign).filter(
+            Campaign.active == True,
+            Campaign.spent < Campaign.budget
+        ).all()
+    except Exception:
+        matching = []
 
     best_bid = None
     best_campaign = None
@@ -167,15 +189,18 @@ async def openrtb_bid(request: Request, db: Session = Depends(get_db)):
     if not best_bid:
         return JSONResponse(status_code=204, content={})
 
-    log = BidLog(
-        campaign_id=best_campaign.id,
-        request_id=request_id,
-        country=country,
-        bid_price=best_bid["price"],
-        won=False
-    )
-    db.add(log)
-    db.commit()
+    try:
+        log = BidLog(
+            campaign_id=best_campaign.id,
+            request_id=request_id,
+            country=country,
+            bid_price=best_bid["price"],
+            won=False
+        )
+        db.add(log)
+        db.commit()
+    except Exception:
+        pass
 
     bid_response = {
         "id": request_id,
@@ -196,7 +221,6 @@ async def openrtb_bid(request: Request, db: Session = Depends(get_db)):
 
 @app.post("/openrtb/win")
 async def win_notice(request: Request, db: Session = Depends(get_db)):
-    data = await request.json()
     return {"status": "ok"}
 
 @app.get("/health")
@@ -205,9 +229,12 @@ def health():
 
 @app.get("/billing")
 def billing_info(db: Session = Depends(get_db)):
-    account = db.query(Account).first()
-    return {
-        "credit_balance": account.credit_balance if account else 0,
-        "currency": "USD",
-        "note": "Integrate Stripe or PayPal webhooks here to top up credit_balance when agreements are ready."
-    }
+    try:
+        account = db.query(Account).first()
+        return {
+            "credit_balance": account.credit_balance if account else 0,
+            "currency": "USD",
+            "note": "Integrate Stripe or PayPal webhooks here to top up credit_balance when agreements are ready."
+        }
+    except Exception:
+        return {"credit_balance": 0, "currency": "USD", "note": "DB unavailable"}
