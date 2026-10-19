@@ -2,7 +2,7 @@ import json
 import uuid
 import os
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -34,16 +34,6 @@ class Campaign(Base):
     active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-class BidLog(Base):
-    __tablename__ = "bid_logs"
-    id = Column(Integer, primary_key=True, index=True)
-    campaign_id = Column(Integer)
-    request_id = Column(String)
-    country = Column(String)
-    bid_price = Column(Float)
-    won = Column(Boolean, default=False)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-
 class Account(Base):
     __tablename__ = "accounts"
     id = Column(Integer, primary_key=True, index=True)
@@ -59,10 +49,10 @@ except Exception as e:
 class CampaignCreate(BaseModel):
     name: str
     budget: float
-    daily_cap: float
+    daily_cap: float = 0.0
     bid_price: float
-    geos: List[str]
-    creative_html: str
+    geos: List[str] = []
+    creative_html: str = ""
     active: bool = True
 
 class CampaignOut(BaseModel):
@@ -80,11 +70,6 @@ class CampaignOut(BaseModel):
 
 app = FastAPI(title="Instigator DSP")
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    return PlainTextResponse(f"ERROR:\n{tb}", status_code=500)
-
 def get_db():
     db = SessionLocal()
     try:
@@ -95,20 +80,21 @@ def get_db():
 @app.on_event("startup")
 def init_db():
     try:
+        Base.metadata.create_all(bind=engine)
         db = SessionLocal()
         if not db.query(Account).first():
             db.add(Account(name="Instigator Default", credit_balance=1000.0))
             db.commit()
         db.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"init warning: {e}")
 
 def render_dashboard(campaigns, account):
     credit = f"${account.credit_balance:.2f} {account.currency}" if account else "$0.00"
     rows = ""
     if campaigns:
         for c in campaigns:
-            geos = ", ".join(c.geos) if c.geos else "Global"
+            geos = ", ".join(c.geos or []) if c.geos else "Global"
             status = "Active" if c.active else "Paused"
             rows += f"""
             <tr class="border-t">
@@ -127,7 +113,6 @@ def render_dashboard(campaigns, account):
 <html>
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Instigator DSP</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
@@ -135,7 +120,7 @@ def render_dashboard(campaigns, account):
   <div class="container mx-auto px-4 py-8">
     <header class="mb-8">
       <h1 class="text-4xl font-bold text-indigo-700">Instigator DSP</h1>
-      <p class="text-gray-600">Demand Side Platform MVP • Ready for OpenRTB & Payments</p>
+      <p class="text-gray-600">Demand Side Platform MVP</p>
       <div class="mt-2 bg-white p-4 rounded shadow inline-block">
         <span class="font-semibold">Credit Balance:</span> {credit}
       </div>
@@ -154,26 +139,11 @@ def render_dashboard(campaigns, account):
     </section>
     <section class="bg-white p-6 rounded shadow">
       <h2 class="text-2xl font-semibold mb-4">Campaigns</h2>
-      <div class="overflow-x-auto">
-        <table class="min-w-full">
-          <thead>
-            <tr class="bg-gray-50">
-              <th class="text-left p-2">Name</th>
-              <th class="text-left p-2">Budget</th>
-              <th class="text-left p-2">Spent</th>
-              <th class="text-left p-2">Bid CPM</th>
-              <th class="text-left p-2">Geos</th>
-              <th class="text-left p-2">Status</th>
-              <th class="text-left p-2">Actions</th>
-            </tr>
-          </thead>
-          <tbody>{rows}</tbody>
-        </table>
-      </div>
+      <table class="min-w-full"><thead><tr class="bg-gray-50"><th class="text-left p-2">Name</th><th class="text-left p-2">Budget</th><th class="text-left p-2">Spent</th><th class="text-left p-2">Bid CPM</th><th class="text-left p-2">Geos</th><th class="text-left p-2">Status</th><th class="text-left p-2">Actions</th></tr></thead>
+      <tbody>{rows}</tbody></table>
     </section>
     <section class="mt-8 bg-white p-6 rounded shadow">
       <h2 class="text-2xl font-semibold mb-2">OpenRTB Endpoint</h2>
-      <p>Ready for SSP connections:</p>
       <code class="block bg-gray-100 p-2 mt-2 rounded">POST /openrtb/bid</code>
     </section>
   </div>
@@ -187,7 +157,7 @@ def render_dashboard(campaigns, account):
         daily_cap: parseFloat(document.getElementById('daily_cap').value) || 0,
         bid_price: parseFloat(document.getElementById('bid_price').value),
         geos: geos,
-        creative_html: document.getElementById('creative_html').value || '<div style="background:#eee;padding:10px">Instigator Ad</div>',
+        creative_html: document.getElementById('creative_html').value || '<div>Instigator Ad</div>',
         active: true
       }};
       const res = await fetch('/api/campaigns', {{
@@ -195,8 +165,12 @@ def render_dashboard(campaigns, account):
         headers: {{'Content-Type': 'application/json'}},
         body: JSON.stringify(payload)
       }});
-      if (res.ok) location.reload();
-      else alert('Error creating campaign');
+      if (res.ok) {{
+        location.reload();
+      }} else {{
+        const text = await res.text();
+        alert('Error creating campaign: ' + text);
+      }}
     }});
     async function toggleCampaign(id) {{
       await fetch('/api/campaigns/' + id + '/toggle', {{ method: 'PUT' }});
@@ -216,17 +190,35 @@ async def dashboard(db: Session = Depends(get_db)):
         account = None
     return HTMLResponse(content=render_dashboard(campaigns, account))
 
-@app.post("/api/campaigns", response_model=CampaignOut)
+@app.post("/api/campaigns")
 def create_campaign(campaign: CampaignCreate, db: Session = Depends(get_db)):
-    db_campaign = Campaign(**campaign.dict())
-    db.add(db_campaign)
-    db.commit()
-    db.refresh(db_campaign)
-    return db_campaign
-
-@app.get("/api/campaigns", response_model=List[CampaignOut])
-def list_campaigns(db: Session = Depends(get_db)):
-    return db.query(Campaign).all()
+    try:
+        Base.metadata.create_all(bind=engine)
+        db_campaign = Campaign(
+            name=campaign.name,
+            budget=campaign.budget,
+            daily_cap=campaign.daily_cap,
+            bid_price=campaign.bid_price,
+            geos=campaign.geos or [],
+            creative_html=campaign.creative_html,
+            active=campaign.active
+        )
+        db.add(db_campaign)
+        db.commit()
+        db.refresh(db_campaign)
+        return {{
+            "id": db_campaign.id,
+            "name": db_campaign.name,
+            "budget": db_campaign.budget,
+            "spent": db_campaign.spent,
+            "daily_cap": db_campaign.daily_cap,
+            "bid_price": db_campaign.bid_price,
+            "geos": db_campaign.geos or [],
+            "creative_html": db_campaign.creative_html,
+            "active": db_campaign.active
+        }}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={{"error": str(e), "traceback": traceback.format_exc()}})
 
 @app.put("/api/campaigns/{campaign_id}/toggle")
 def toggle_campaign(campaign_id: int, db: Session = Depends(get_db)):
@@ -261,7 +253,8 @@ async def openrtb_bid(request: Request, db: Session = Depends(get_db)):
     best_bid = None
     best_campaign = None
     for campaign in matching:
-        if campaign.geos and country not in [g.upper() for g in (campaign.geos or [])]:
+        geos = campaign.geos or []
+        if geos and country not in [g.upper() for g in geos]:
             continue
         if campaign.bid_price > 0 and (not best_bid or campaign.bid_price > best_bid["price"]):
             best_bid = {"price": campaign.bid_price, "adm": campaign.creative_html or "<div>Instigator Ad</div>"}
@@ -269,13 +262,6 @@ async def openrtb_bid(request: Request, db: Session = Depends(get_db)):
 
     if not best_bid:
         return JSONResponse(status_code=204, content={})
-
-    try:
-        log = BidLog(campaign_id=best_campaign.id, request_id=request_id, country=country, bid_price=best_bid["price"])
-        db.add(log)
-        db.commit()
-    except Exception:
-        pass
 
     return {{
         "id": request_id,
@@ -285,12 +271,11 @@ async def openrtb_bid(request: Request, db: Session = Depends(get_db)):
             "price": best_bid["price"],
             "adm": best_bid["adm"],
             "crid": f"instigator-{{best_campaign.id}}",
-            "cid": str(best_campaign.id),
-            "adid": str(best_campaign.id)
+            "cid": str(best_campaign.id)
         }}]}}],
         "cur": "USD"
     }}
 
 @app.get("/health")
 def health():
-    return {{"status": "healthy", "service": "Instigator DSP"}}
+    return {"status": "healthy", "service": "Instigator DSP"}
