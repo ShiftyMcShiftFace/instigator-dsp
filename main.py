@@ -2,7 +2,7 @@ import json
 import uuid
 import os
 import pathlib
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Request, Depends
@@ -13,20 +13,15 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 
-# Robust template path (works on Render)
-BASE_DIR = pathlib.Path(__file__).resolve().parent
-TEMPLATES_DIR = BASE_DIR / "templates"
+# Always use in-memory SQLite on Render for reliability
+if os.getenv("RENDER"):
+    SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
+else:
+    SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./instigator.db")
 
-# Database setup - use /tmp on Render for writability
-def get_database_url():
-    if os.getenv("RENDER"):
-        return "sqlite:////tmp/instigator.db"
-    return os.getenv("DATABASE_URL", "sqlite:///./instigator.db")
-
-SQLALCHEMY_DATABASE_URL = get_database_url()
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
-    connect_args={"check_same_thread": False} if SQLALCHEMY_DATABASE_URL.startswith("sqlite") else {},
+    connect_args={"check_same_thread": False},
     pool_pre_ping=True
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -65,7 +60,7 @@ class Account(Base):
 try:
     Base.metadata.create_all(bind=engine)
 except Exception as e:
-    print(f"Warning: could not create tables: {e}")
+    print(f"DB create warning: {e}")
 
 class CampaignCreate(BaseModel):
     name: str
@@ -89,9 +84,16 @@ class CampaignOut(BaseModel):
     class Config:
         from_attributes = True
 
-app = FastAPI(title="Instigator DSP", description="Demand Side Platform MVP for Programmatic Advertising")
+app = FastAPI(title="Instigator DSP")
 
-templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+# Template setup with absolute path
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+TEMPLATES_DIR = BASE_DIR / "templates"
+templates = None
+try:
+    templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+except Exception as e:
+    print(f"Template init warning: {e}")
 
 def get_db():
     db = SessionLocal()
@@ -109,22 +111,38 @@ def init_db():
             db.commit()
         db.close()
     except Exception as e:
-        print(f"Warning: init_db failed: {e}")
+        print(f"init_db warning: {e}")
+
+FALLBACK_HTML = """
+<!DOCTYPE html>
+<html>
+<head><title>Instigator DSP</title><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-100 p-8">
+  <h1 class="text-4xl font-bold text-indigo-700">Instigator DSP</h1>
+  <p class="mt-2 text-gray-600">Demand Side Platform MVP — running on Render</p>
+  <div class="mt-6 bg-white p-4 rounded shadow">
+    <p>OpenRTB endpoint: <code>POST /openrtb/bid</code></p>
+    <p class="mt-2">Health: <a href="/health" class="text-indigo-600">/health</a></p>
+  </div>
+</body>
+</html>
+"""
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request, db: Session = Depends(get_db)):
     try:
         campaigns = db.query(Campaign).all()
         account = db.query(Account).first()
-    except Exception:
-        campaigns = []
-        account = None
-    return templates.TemplateResponse("dashboard.html", {
-        "request": request,
-        "campaigns": campaigns,
-        "account": account,
-        "title": "Instigator DSP"
-    })
+        if templates:
+            return templates.TemplateResponse("dashboard.html", {
+                "request": request,
+                "campaigns": campaigns,
+                "account": account,
+                "title": "Instigator DSP"
+            })
+    except Exception as e:
+        print(f"Dashboard error: {e}")
+    return HTMLResponse(content=FALLBACK_HTML)
 
 @app.post("/api/campaigns", response_model=CampaignOut)
 def create_campaign(campaign: CampaignCreate, db: Session = Depends(get_db)):
@@ -164,77 +182,51 @@ async def openrtb_bid(request: Request, db: Session = Depends(get_db)):
     country = geo.get("country", "").upper()
 
     try:
-        matching = db.query(Campaign).filter(
-            Campaign.active == True,
-            Campaign.spent < Campaign.budget
-        ).all()
+        matching = db.query(Campaign).filter(Campaign.active == True, Campaign.spent < Campaign.budget).all()
     except Exception:
         matching = []
 
     best_bid = None
     best_campaign = None
-
     for campaign in matching:
         if campaign.geos and country not in [g.upper() for g in campaign.geos]:
             continue
-        if campaign.bid_price > 0:
-            if not best_bid or campaign.bid_price > best_bid["price"]:
-                best_bid = {
-                    "price": campaign.bid_price,
-                    "campaign": campaign,
-                    "adm": campaign.creative_html or "<div>Instigator Ad</div>"
-                }
-                best_campaign = campaign
+        if campaign.bid_price > 0 and (not best_bid or campaign.bid_price > best_bid["price"]):
+            best_bid = {"price": campaign.bid_price, "adm": campaign.creative_html or "<div>Instigator Ad</div>"}
+            best_campaign = campaign
 
     if not best_bid:
         return JSONResponse(status_code=204, content={})
 
     try:
-        log = BidLog(
-            campaign_id=best_campaign.id,
-            request_id=request_id,
-            country=country,
-            bid_price=best_bid["price"],
-            won=False
-        )
+        log = BidLog(campaign_id=best_campaign.id, request_id=request_id, country=country, bid_price=best_bid["price"])
         db.add(log)
         db.commit()
     except Exception:
         pass
 
-    bid_response = {
+    return {
         "id": request_id,
-        "seatbid": [{
-            "bid": [{
-                "id": str(uuid.uuid4()),
-                "impid": impressions[0].get("id", "1"),
-                "price": best_bid["price"],
-                "adm": best_bid["adm"],
-                "crid": f"instigator-{best_campaign.id}",
-                "cid": str(best_campaign.id),
-                "adid": str(best_campaign.id)
-            }]
-        }],
+        "seatbid": [{"bid": [{
+            "id": str(uuid.uuid4()),
+            "impid": impressions[0].get("id", "1"),
+            "price": best_bid["price"],
+            "adm": best_bid["adm"],
+            "crid": f"instigator-{best_campaign.id}",
+            "cid": str(best_campaign.id),
+            "adid": str(best_campaign.id)
+        }]}],
         "cur": "USD"
     }
-    return bid_response
-
-@app.post("/openrtb/win")
-async def win_notice(request: Request, db: Session = Depends(get_db)):
-    return {"status": "ok"}
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "service": "Instigator DSP"}
+    return {"status": "healthy", "service": "Instigator DSP", "db": "in-memory" if os.getenv("RENDER") else "file"}
 
 @app.get("/billing")
 def billing_info(db: Session = Depends(get_db)):
     try:
         account = db.query(Account).first()
-        return {
-            "credit_balance": account.credit_balance if account else 0,
-            "currency": "USD",
-            "note": "Integrate Stripe or PayPal webhooks here to top up credit_balance when agreements are ready."
-        }
+        return {"credit_balance": account.credit_balance if account else 0, "currency": "USD"}
     except Exception:
-        return {"credit_balance": 0, "currency": "USD", "note": "DB unavailable"}
+        return {"credit_balance": 0, "currency": "USD"}
